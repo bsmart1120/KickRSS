@@ -626,20 +626,86 @@ function initEventListeners() {
             }
         });
     }
+    const settingAiModelInputElem = document.getElementById('setting-ai-model');
+    if (settingAiModelInputElem) {
+        settingAiModelInputElem.addEventListener('focus', () => {
+            const oldVal = settingAiModelInputElem.value;
+            settingAiModelInputElem.value = '';
+            const restoreOldVal = () => {
+                if (!settingAiModelInputElem.value.trim()) {
+                    settingAiModelInputElem.value = oldVal;
+                }
+                settingAiModelInputElem.removeEventListener('blur', restoreOldVal);
+            };
+            settingAiModelInputElem.addEventListener('blur', restoreOldVal);
+        });
+    }
+
+    const settingAiUrlInput = document.getElementById('setting-ai-url');
+    const settingAiKeyInput = document.getElementById('setting-ai-key');
+    if (settingAiUrlInput) {
+        const triggerFetch = () => {
+            const apiBaseUrl = settingAiUrlInput.value.trim();
+            const apiKey = settingAiKeyInput ? settingAiKeyInput.value.trim() : '';
+            if (apiBaseUrl) {
+                fetchAndPopulateModels(apiBaseUrl, apiKey);
+            }
+        };
+        settingAiUrlInput.addEventListener('blur', triggerFetch);
+        if (settingAiKeyInput) {
+            settingAiKeyInput.addEventListener('blur', triggerFetch);
+        }
+    }
+
     const btnTestLLM = document.getElementById('btn-test-llm');
     if (btnTestLLM) {
         btnTestLLM.addEventListener('click', async () => {
             const apiBaseUrl = document.getElementById('setting-ai-url').value.trim();
             const apiKey = document.getElementById('setting-ai-key').value.trim();
-            const apiModel = document.getElementById('setting-ai-model').value.trim();
+            let apiModel = document.getElementById('setting-ai-model').value.trim();
             
             const resultSpan = document.getElementById('llm-test-result');
-            resultSpan.textContent = '正在测试连接...';
+            resultSpan.textContent = '正在获取模型列表...';
             resultSpan.style.color = 'var(--text-muted)';
             
             btnTestLLM.disabled = true;
             
             try {
+                // First, fetch models list
+                const getModelsRes = await fetch('/settings/get-models', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        ai_base_url: apiBaseUrl,
+                        ai_api_key: apiKey
+                    })
+                });
+                const modelsData = await getModelsRes.json();
+                
+                const datalist = document.getElementById('setting-ai-model-list');
+                if (modelsData.success && modelsData.models && modelsData.models.length > 0) {
+                    if (datalist) {
+                        datalist.innerHTML = '';
+                        modelsData.models.forEach(m => {
+                            const option = document.createElement('option');
+                            option.value = m;
+                            datalist.appendChild(option);
+                        });
+                    }
+                    if (!apiModel) {
+                        apiModel = modelsData.models[0];
+                        document.getElementById('setting-ai-model').value = apiModel;
+                    }
+                }
+                
+                if (!apiModel) {
+                    resultSpan.textContent = '未指定测试模型，且自动获取模型列表失败。请手动填写。';
+                    resultSpan.style.color = '#ef4444';
+                    btnTestLLM.disabled = false;
+                    return;
+                }
+                
+                resultSpan.textContent = `正在对模型 ${apiModel} 进行推理及可用性测试...`;
                 const startTime = Date.now();
                 const res = await fetch('/settings/test-llm', {
                     method: 'POST',
@@ -655,15 +721,28 @@ function initEventListeners() {
                 const duration = ((Date.now() - startTime) / 1000).toFixed(1);
                 
                 if (data.success) {
-                    resultSpan.textContent = `连接成功！耗时 ${duration}s，响应: ${data.model_response}`;
-                    resultSpan.style.color = '#10b981';
+                    let msg = `连接成功！耗时 ${duration}s。`;
+                    if (data.reasoning_status === 'not_reasoning') {
+                        msg += `标准模型 (非推理模型，正常消耗 token)。`;
+                        resultSpan.style.color = '#10b981';
+                    } else if (data.reasoning_status === 'disabled_successfully') {
+                        msg += `推理模型 (已成功关闭推理，避免 token 浪费)。`;
+                        resultSpan.style.color = '#10b981';
+                    } else if (data.reasoning_status === 'unable_to_disable') {
+                        msg += `⚠️ 推理模型 (警告: 无法关闭推理，会产生多余的思考过程并浪费 token！)。`;
+                        resultSpan.style.color = '#f59e0b';
+                    } else {
+                        msg += `响应: ${data.model_response}`;
+                        resultSpan.style.color = '#10b981';
+                    }
+                    resultSpan.textContent = msg;
                 } else {
-                    resultSpan.textContent = `连接失败: ${data.message}`;
+                    resultSpan.textContent = `测试失败: ${data.message}`;
                     resultSpan.style.color = '#ef4444';
                 }
             } catch (err) {
                 console.error(err);
-                resultSpan.textContent = '网络错误，连接失败。';
+                resultSpan.textContent = '网络错误，测试失败。';
                 resultSpan.style.color = '#ef4444';
             } finally {
                 btnTestLLM.disabled = false;
@@ -2794,8 +2873,15 @@ async function handleChatSubmit(e) {
         const decoder = new TextDecoder();
         let buffer = "";
         let fullReplyText = "";
+        let thinkingText = "";
         
         aiBubble.textContent = ""; // clear thinking placeholder
+        aiBubble.innerHTML = `
+            <div class="ai-thinking-section" style="display: none; width: 100%;"></div>
+            <div class="ai-reply-section" style="width: 100%;"></div>
+        `;
+        const thinkingSec = aiBubble.querySelector('.ai-thinking-section');
+        const replySec = aiBubble.querySelector('.ai-reply-section');
         
         while (true) {
             const { value, done } = await reader.read();
@@ -2813,9 +2899,31 @@ async function handleChatSubmit(e) {
                     const dataStr = trimmed.slice(5).trim();
                     try {
                         const data = JSON.parse(dataStr);
-                        if (data.status === 'streaming' && data.reply) {
+                        if (data.status === 'thinking' && data.reply) {
+                            thinkingText += data.reply;
+                            thinkingSec.style.display = 'block';
+                            let displayText = thinkingText;
+                            if (displayText.length > 60) {
+                                displayText = '...' + displayText.slice(-57);
+                            }
+                            thinkingSec.innerHTML = `
+                                <div class="thinking-box" style="font-size: 11px; color: var(--text-muted); font-style: italic; display: flex; align-items: center; gap: 6px; padding: 6px 10px; background: rgba(255,255,255,0.03); border-radius: 6px; border: 1px dashed var(--border-color); max-width: 100%; margin-bottom: 8px;">
+                                    <span style="flex-shrink: 0; display: inline-flex; animation: spin 2s linear infinite;">🌀</span>
+                                    <span style="overflow: hidden; white-space: nowrap; text-overflow: ellipsis; flex: 1;">思考中: ${escapeHTML(displayText)}</span>
+                                </div>
+                            `;
+                            elements.chatHistory.scrollTop = elements.chatHistory.scrollHeight;
+                        } else if (data.status === 'streaming' && data.reply) {
+                            if (thinkingText) {
+                                thinkingSec.innerHTML = `
+                                    <div class="thinking-box completed" style="font-size: 11px; color: var(--text-muted); opacity: 0.8; display: inline-flex; align-items: center; gap: 6px; padding: 4px 8px; background: rgba(255,255,255,0.01); border-radius: 6px; border: 1px dotted var(--border-color); margin-bottom: 8px;">
+                                        <span style="color: #10b981;">✅</span>
+                                        <span>已完成思考</span>
+                                    </div>
+                                `;
+                            }
                             fullReplyText += data.reply;
-                            aiBubble.innerHTML = formatChatReply(fullReplyText);
+                            replySec.innerHTML = formatChatReply(fullReplyText);
                             // Scroll chat history to bottom
                             elements.chatHistory.scrollTop = elements.chatHistory.scrollHeight;
                         } else if (data.status === 'done') {
@@ -3793,6 +3901,38 @@ function switchManageModalTab(tab) {
     }
 }
 
+async function fetchAndPopulateModels(apiBaseUrl, apiKey) {
+    if (!apiBaseUrl) return;
+    const datalist = document.getElementById('setting-ai-model-list');
+    if (!datalist) return;
+    try {
+        const res = await fetch('/settings/get-models', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                ai_base_url: apiBaseUrl,
+                ai_api_key: apiKey
+            })
+        });
+        const data = await res.json();
+        if (data.success && data.models && data.models.length > 0) {
+            datalist.innerHTML = '';
+            data.models.forEach(model => {
+                const option = document.createElement('option');
+                option.value = model;
+                datalist.appendChild(option);
+            });
+            
+            const modelInput = document.getElementById('setting-ai-model');
+            if (modelInput && !modelInput.value.trim()) {
+                modelInput.value = data.models[0];
+            }
+        }
+    } catch (err) {
+        console.error('Failed to pre-fetch models:', err);
+    }
+}
+
 async function loadAndRenderSystemSettings() {
     try {
         const response = await fetch('/settings');
@@ -3835,6 +3975,9 @@ async function loadAndRenderSystemSettings() {
         if (elements.settingAiUrl) elements.settingAiUrl.value = settingsData.ai_base_url;
         if (elements.settingAiKey) elements.settingAiKey.value = settingsData.ai_api_key;
         if (elements.settingAiModel) elements.settingAiModel.value = settingsData.ai_model;
+        if (settingsData.ai_base_url) {
+            fetchAndPopulateModels(settingsData.ai_base_url, settingsData.ai_api_key);
+        }
         
         if (elements.settingAiPregenerate) elements.settingAiPregenerate.checked = settingsData.ai_pregenerate;
         if (elements.settingAiStream) elements.settingAiStream.checked = settingsData.ai_stream;
@@ -4213,7 +4356,7 @@ const TRANSLATIONS = {
         "settings_ai_url_label": "API Base URL",
         "settings_ai_key_label": "API Key",
         "settings_ai_model_label": "AI 模型名称",
-        "settings_btn_test_llm": "检查 LLM API 可用性",
+        "settings_btn_test_llm": "获取模型并测试",
         "settings_token_consumption_label": "今日 AI Token 消耗 (Tokens):",
         "settings_token_prompt": "输入: ",
         "settings_token_completion": "输出: ",
@@ -4372,7 +4515,7 @@ const TRANSLATIONS = {
         "settings_ai_url_label": "API Base URL",
         "settings_ai_key_label": "API Key",
         "settings_ai_model_label": "AI 模型名稱",
-        "settings_btn_test_llm": "檢查 LLM API 可用性",
+        "settings_btn_test_llm": "獲取模型並測試",
         "settings_token_consumption_label": "今日 AI Token 消耗 (Tokens):",
         "settings_token_prompt": "輸入: ",
         "settings_token_completion": "輸出: ",
@@ -4531,7 +4674,7 @@ const TRANSLATIONS = {
         "settings_ai_url_label": "API Base URL",
         "settings_ai_key_label": "API Key",
         "settings_ai_model_label": "AI Model Name",
-        "settings_btn_test_llm": "Check LLM API Availability",
+        "settings_btn_test_llm": "Get Models & Test",
         "settings_token_consumption_label": "Today's AI Token Consumption (Tokens):",
         "settings_token_prompt": "Prompt: ",
         "settings_token_completion": "Completion: ",
@@ -4690,7 +4833,7 @@ const TRANSLATIONS = {
         "settings_ai_url_label": "API Base URL",
         "settings_ai_key_label": "API Key",
         "settings_ai_model_label": "AIモデル名",
-        "settings_btn_test_llm": "LLM APIの可用性を確認",
+        "settings_btn_test_llm": "モデル取得とテスト",
         "settings_token_consumption_label": "本日のAI Token消費量 (Tokens):",
         "settings_token_prompt": "プロンプト: ",
         "settings_token_completion": "完了: ",
@@ -4849,7 +4992,7 @@ const TRANSLATIONS = {
         "settings_ai_url_label": "API Base URL",
         "settings_ai_key_label": "API Key",
         "settings_ai_model_label": "AI 모델명",
-        "settings_btn_test_llm": "LLM API 가용성 확인",
+        "settings_btn_test_llm": "모델 가져오기 및 테스트",
         "settings_token_consumption_label": "오늘의 AI 토큰 소비량 (Tokens):",
         "settings_token_prompt": "입력: ",
         "settings_token_completion": "출력: ",
@@ -5008,7 +5151,7 @@ const TRANSLATIONS = {
         "settings_ai_url_label": "API Base URL",
         "settings_ai_key_label": "Clé API",
         "settings_ai_model_label": "Nom du modèle IA",
-        "settings_btn_test_llm": "Tester la disponibilité de l'API LLM",
+        "settings_btn_test_llm": "Obtenir les modèles et tester",
         "settings_token_consumption_label": "Consommation de jetons IA d'aujourd'hui (Jetons) :",
         "settings_token_prompt": "Invite : ",
         "settings_token_completion": "Complétion : ",
@@ -5167,7 +5310,7 @@ const TRANSLATIONS = {
         "settings_ai_url_label": "API Base URL",
         "settings_ai_key_label": "Clave API",
         "settings_ai_model_label": "Nombre del modelo de IA",
-        "settings_btn_test_llm": "Comprobar disponibilidad de API LLM",
+        "settings_btn_test_llm": "Obtener modelos y probar",
         "settings_token_consumption_label": "Consumo de tokens de IA hoy (Tokens):",
         "settings_token_prompt": "Prompt: ",
         "settings_token_completion": "Completado: ",
@@ -5326,7 +5469,7 @@ const TRANSLATIONS = {
         "settings_ai_url_label": "API Base URL",
         "settings_ai_key_label": "API Key",
         "settings_ai_model_label": "KI-Modellname",
-        "settings_btn_test_llm": "LLM-API-Verfügbarkeit prüfen",
+        "settings_btn_test_llm": "Modelle abrufen & testen",
         "settings_token_consumption_label": "Heutiger AI Token-Verbrauch (Tokens):",
         "settings_token_prompt": "Prompt: ",
         "settings_token_completion": "Antwort: ",
@@ -5867,16 +6010,16 @@ function updateUILanguage(lang) {
     const optAuto = document.querySelector('#setting-ai-summary-lang option[value="auto"]');
     if (optAuto) {
         const autoText = {
-            'zh': '跟随原文 (Auto)',
-            'zh-hant': '跟隨原文 (Auto)',
-            'en': 'Follow Original (Auto)',
-            'ja': '原文に従う (Auto)',
-            'ko': '원본 문서 언어 (Auto)',
-            'fr': 'Suivre l\'original (Auto)',
-            'es': 'Seguir original (Auto)',
-            'de': 'Original folgen (Auto)'
+            'zh': '跟随系统语言 (Auto)',
+            'zh-hant': '跟隨系統語言 (Auto)',
+            'en': 'Follow System Language (Auto)',
+            'ja': 'システム言語に従う (Auto)',
+            'ko': '시스템 언어 따름 (Auto)',
+            'fr': 'Suivre la langue du système (Auto)',
+            'es': 'Seguir idioma del sistema (Auto)',
+            'de': 'Systemsprache folgen (Auto)'
         };
-        optAuto.textContent = autoText[lang] || '跟随原文 (Auto)';
+        optAuto.textContent = autoText[lang] || '跟随系统语言 (Auto)';
     }
 }
 

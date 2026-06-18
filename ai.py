@@ -25,7 +25,8 @@ def estimate_clean_text_length(text: str) -> int:
 def call_chat_completion(
     config: Dict[str, Any], 
     messages: List[Dict[str, str]], 
-    response_format_json: bool = True
+    response_format_json: bool = True,
+    disable_reasoning: bool = True
 ) -> str:
     """
     Perform a POST request to the OpenAI-compatible endpoint.
@@ -49,11 +50,25 @@ def call_chat_completion(
     if response_format_json:
         payload["response_format"] = {"type": "json_object"}
         
+    disabler_added = False
+    if disable_reasoning:
+        append_reasoning_disabler(payload, config["model"], config["base_url"])
+        disabler_added = True
+        
     try:
         try:
             with httpx.Client(timeout=120.0) as client:
                 response = client.post(url, headers=headers, json=payload)
             
+            # If 400 Bad Request and we added disablers, retry without them
+            if response.status_code == 400 and disabler_added:
+                logger.warning("Endpoint returned 400; retrying without reasoning disablers")
+                for field in ["chat_template_kwargs", "thinking", "thinking_config", "think", "enable_thinking"]:
+                    payload.pop(field, None)
+                disabler_added = False
+                with httpx.Client(timeout=120.0) as client:
+                    response = client.post(url, headers=headers, json=payload)
+                    
             # Fallback if JSON mode is not supported by the endpoint (e.g. returns 400 Bad Request)
             if response.status_code == 400 and response_format_json:
                 logger.warning("Endpoint returned 400; retrying without response_format='json_object'")
@@ -63,9 +78,11 @@ def call_chat_completion(
             
             response.raise_for_status()
         except Exception as initial_err:
-            if response_format_json:
-                logger.warning(f"Initial request failed with {initial_err}; retrying without response_format='json_object'")
+            if response_format_json or disabler_added:
+                logger.warning(f"Initial request failed with {initial_err}; retrying with absolute fallback")
                 payload.pop("response_format", None)
+                for field in ["chat_template_kwargs", "thinking", "thinking_config", "think", "enable_thinking"]:
+                    payload.pop(field, None)
                 with httpx.Client(timeout=120.0) as client:
                     response = client.post(url, headers=headers, json=payload)
                 response.raise_for_status()
@@ -103,6 +120,7 @@ def call_chat_completion(
                 # Fallback: use reasoning as-is
                 content = reasoning
         
+        content = clean_think_block(content)
         return content
     except Exception as e:
         logger.error(f"Error calling AI completions API at {url}: {e}", exc_info=True)
@@ -249,6 +267,10 @@ def get_summary_messages(
         length = settings.summary_length
     if not summary_lang:
         summary_lang = settings.summary_language
+    if summary_lang == "auto" or not summary_lang:
+        summary_lang = settings.system_language
+    if summary_lang == "auto" or not summary_lang:
+        summary_lang = "zh"
         
     is_numeric_length = False
     try:
@@ -316,25 +338,54 @@ def get_summary_messages(
         "it": ("Italian (Italiano)", "Italiano", "意大利语")
     }
     
+    is_chinese = (summary_lang in ["zh", "zh-hant"])
     if summary_lang in lang_map:
         eng_name, local_name, chn_name = lang_map[summary_lang]
-        lang_rule = (
-            f"CRITICAL: The summary must be written in {eng_name} ({local_name}) ONLY, regardless of the original language of the article.\n"
-            f"- If the article is in Chinese or English, you MUST translate the key concepts and write the summary in {eng_name} ({local_name}).\n"
-            f"- 必须且只能使用 {chn_name} ({local_name}) 撰写 SUMMARY 部分，绝对不要使用原文语言（如中文或英文）来写摘要。"
-        )
-        if is_numeric_length:
-            lang_rule += (
-                f"\n- 必须写满大约 {target_chars} 个{chn_name}（汉字）（字数范围必须严格控制在 {int(target_chars * 0.9)} 到 {int(target_chars * 1.15)} 字之间）。\n"
-                f"- 这是字数的硬性指令，请把观点铺开、细节写饱满，绝对不能偷懒缩短！\n"
-                f"- 编写要求：{cn_structure_advice}"
+        if is_chinese:
+            lang_rule = (
+                f"CRITICAL: The summary must be written in {eng_name} ({local_name}) ONLY, regardless of the original language of the article.\n"
+                f"- 必须且只能使用 {chn_name} ({local_name}) 撰写 SUMMARY 部分，绝对不要使用原文语言来写摘要。"
             )
-        reminder = f"\n\nReminder: You MUST write the SUMMARY in {eng_name} ({local_name}). (提示：请务必且只能使用 {chn_name} / {local_name} 撰写摘要。)"
+            if is_numeric_length:
+                lang_rule += (
+                    f"\n- 必须写满大约 {target_chars} 个汉字（字数范围必须严格控制在 {int(target_chars * 0.9)} 到 {int(target_chars * 1.15)} 字之间）。\n"
+                    f"- 这是字数的硬性指令，请把观点铺开、细节写饱满，绝对不能偷懒缩短！\n"
+                    f"- 编写要求：{cn_structure_advice}"
+                )
+            reminder = f"\n\nReminder: You MUST write the SUMMARY in {eng_name} ({local_name}). (提示：请务必且只能使用 {chn_name} / {local_name} 撰写摘要。)"
+        else:
+            lang_rule = (
+                f"CRITICAL: The summary must be written in {eng_name} ({local_name}) ONLY, regardless of the original language of the article.\n"
+                f"- You MUST write the SUMMARY portion in {eng_name} ({local_name}) ONLY. Do NOT write the summary in the original language if it is different. You MUST translate and write it in {eng_name}."
+            )
+            if is_numeric_length:
+                lang_rule += (
+                    f"\n- The summary MUST target approximately {target_chars} characters in {eng_name}.\n"
+                    f"- Provide details and explain arguments fully to satisfy the length requirement.\n"
+                    f"- Requirements: {structure_advice}"
+                )
+            reminder = f"\n\nReminder: You MUST write the SUMMARY in {eng_name} ({local_name}) ONLY."
     else:
         lang_rule = "The summary must be in the same language as the article content."
         if is_numeric_length:
             lang_rule += f"\n- CRITICAL: The generated summary MUST target approximately {target_chars} characters. DO NOT make it too short.\n- Requirements: {structure_advice}"
         reminder = ""
+
+    formatting_guidelines = (
+        "- Formatting Guidelines (Extremely Important):\n"
+        "  - Use markdown formatting to make the summary highly readable.\n"
+        "  - Structure the summary primarily as a detailed bullet list starting with '-' (e.g., `- **Point Name**: Explanation`). Each bullet point should be highly informative, specific, and detailed.\n"
+        "  - You may introduce the summary with a very brief opening paragraph (1-2 sentences), but the core of the summary must be structured as detailed list items rather than plain paragraphs.\n"
+        "  - Selectively use double asterisks (`**text**`) to bold key conclusions, core arguments, or sentences that need focus to make the summary scannable."
+    )
+    if is_chinese:
+        formatting_guidelines += (
+            "\n- 格式与排版规范（极重要）：\n"
+            "  - 必须使用 Markdown 格式排版，确保摘要易读、易扫视。\n"
+            "  - 主要排版结构：必须以条目（无序列表 `- `）为核心排版结构，避免使用大段的文字叙述。每一个条目（例如：`- **核心要点**：详细细节与事实展开`）必须内容扎实、数据细节饱满，并合理换行展开。\n"
+            "  - 可以在最开头有一句非常简短的导语（1-2句），但整个摘要的主体必须是详细具体的条目列表。\n"
+            "  - 突出重点：选择性地将最重要的结论、核心词句或关键数据加粗（使用 `**加粗文本**`），让读者能一眼扫视出文章的精髓，但注意不要过度加粗。"
+        )
 
     system_prompt = (
         "You are an expert RSS assistant. You are given the title, URL, and full-text content of an article.\n"
@@ -346,16 +397,7 @@ def get_summary_messages(
         f"- {rule_desc}\n"
         "- If the content is empty or contains no text, reply exactly with: \"NO_CONTENT\"\n"
         f"- {lang_rule}\n"
-        "- Formatting Guidelines (Extremely Important):\n"
-        "  - Use markdown formatting to make the summary highly readable.\n"
-        "  - Structure the summary primarily as a detailed bullet list starting with '-' (e.g., `- **Point Name**: Explanation`). Each bullet point should be highly informative, specific, and detailed.\n"
-        "  - You may introduce the summary with a very brief opening paragraph (1-2 sentences), but the core of the summary must be structured as detailed list items rather than plain paragraphs.\n"
-        "  - Selectively use double asterisks (`**text**`) to bold key conclusions, core arguments, or sentences that need focus to make the summary scannable.\n"
-        "- 格式与排版规范（极重要）：\n"
-        "  - 必须使用 Markdown 格式排版，确保摘要易读、易扫视。\n"
-        "  - 主要排版结构：必须以条目（无序列表 `- `）为核心排版结构，避免使用大段的文字叙述。每一个条目（例如：`- **核心要点**：详细细节与事实展开`）必须内容扎实、数据细节饱满，并合理换行展开。\n"
-        "  - 可以在最开头有一句非常简短的导语（1-2句），但整个摘要的主体必须是详细具体的条目列表。\n"
-        "  - 突出重点：选择性地将最重要的结论、核心词句或关键数据加粗（使用 `**加粗文本**`），让读者能一眼扫视出文章的精髓，但注意不要过度加粗。\n"
+        f"{formatting_guidelines}\n"
         "- Format your response EXACTLY like this (do NOT translate the prefix keys 'CLICKBAIT_NOTE:' and 'SUMMARY:'):\n"
         "CLICKBAIT_NOTE: <If the title is misleading, state the exact reason and clear up the discrepancy in 1 sentence. If NOT misleading, write NONE>\n"
         "SUMMARY: <write the detailed summary here>"
@@ -416,41 +458,69 @@ def generate_summary_stream(
     }
     if config.get("max_tokens"):
         payload["max_tokens"] = config["max_tokens"]
+
+    append_reasoning_disabler(payload, config["model"], config["base_url"])
+    
+    def fetch_stream(use_disabler):
+        current_payload = dict(payload)
+        if not use_disabler:
+            for field in ["chat_template_kwargs", "thinking", "thinking_config", "think", "enable_thinking"]:
+                current_payload.pop(field, None)
+                
+        filter_obj = ThinkFilter()
+        buffer = ""
+        in_summary = False
         
-    try:
-        logger.info(f"Starting stream summary request to {url_endpoint} with model {config['model']}")
-        with httpx.stream("POST", url_endpoint, headers=headers, json=payload, timeout=120.0) as response:
+        with httpx.stream("POST", url_endpoint, headers=headers, json=current_payload, timeout=120.0) as response:
+            if response.status_code == 400 and use_disabler:
+                raise ValueError("retry_without_disablers")
             response.raise_for_status()
-            chunk_count = 0
-            buffer = ""
-            in_summary = False
+            
             for line in response.iter_lines():
                 if not line.startswith("data:"):
                     continue
                 data_str = line[5:].strip()
                 if data_str == "[DONE]":
-                    logger.info(f"Stream summary received [DONE] after {chunk_count} chunks")
                     break
                 try:
                     data = json.loads(data_str)
                     delta = data["choices"][0]["delta"]
-                    # Get content or reasoning_content
-                    text = delta.get("content") or delta.get("reasoning_content")
+                    text = delta.get("content")
                     if text is not None:
-                        buffer += text
-                        # Check if SUMMARY: appears
-                        if not in_summary and "SUMMARY:" in buffer:
-                            # Extract everything after SUMMARY:
-                            parts = buffer.split("SUMMARY:", 1)
-                            buffer = parts[1].strip()
-                            in_summary = True
-                        # If in_summary, yield the text
-                        if in_summary:
-                            chunk_count += 1
-                            yield text
+                        filtered = filter_obj.filter(text)
+                        if filtered:
+                            buffer += filtered
+                            if not in_summary and "SUMMARY:" in buffer:
+                                parts = buffer.split("SUMMARY:", 1)
+                                yield_text = parts[1].strip()
+                                in_summary = True
+                                if yield_text:
+                                    yield yield_text
+                                buffer = ""
+                            elif in_summary:
+                                yield filtered
                 except Exception as parse_err:
                     logger.debug(f"Stream parse error: {parse_err}")
-            logger.info(f"Stream summary completed with {chunk_count} chunks")
+                    
+            flushed = filter_obj.flush()
+            if flushed:
+                if in_summary:
+                    yield flushed
+                else:
+                    buffer += flushed
+                    if "SUMMARY:" in buffer:
+                        parts = buffer.split("SUMMARY:", 1)
+                        yield parts[1].strip()
+
+    try:
+        try:
+            yield from fetch_stream(use_disabler=True)
+        except ValueError as e:
+            if str(e) == "retry_without_disablers":
+                logger.warning("Stream request returned 400; retrying without reasoning disablers")
+                yield from fetch_stream(use_disabler=False)
+            else:
+                raise
     except Exception as e:
         logger.error(f"Error in stream summary: {e}", exc_info=True)
         raise
@@ -566,6 +636,7 @@ def generate_chat_response_stream(
         payload["max_tokens"] = config["max_tokens"]
         
     try:
+        filter_obj = ThinkFilter()
         with httpx.stream("POST", url_endpoint, headers=headers, json=payload, timeout=30.0) as response:
             response.raise_for_status()
             for line in response.iter_lines():
@@ -576,13 +647,30 @@ def generate_chat_response_stream(
                     try:
                         data = json.loads(data_str)
                         delta = data["choices"][0]["delta"]
-                        # Ignore reasoning_content (internal thinking)
-                        if "reasoning_content" in delta:
+                        
+                        # Handle reasoning_content first if present
+                        if "reasoning_content" in delta and delta["reasoning_content"]:
+                            yield delta["reasoning_content"], True
                             continue
+                            
+                        if "reasoning" in delta and delta["reasoning"]:
+                            yield delta["reasoning"], True
+                            continue
+                            
                         if "content" in delta and delta["content"] is not None:
-                            yield delta["content"]
+                            clean_content, reasoning_content = filter_obj.filter_ex(delta["content"])
+                            if reasoning_content:
+                                yield reasoning_content, True
+                            if clean_content:
+                                yield clean_content, False
                     except Exception:
                         pass
+            flushed = filter_obj.flush()
+            if flushed:
+                if filter_obj.in_think:
+                    yield flushed, True
+                else:
+                    yield flushed, False
     except Exception as e:
         logger.error(f"Error in stream chat response: {e}", exc_info=True)
         raise
@@ -616,7 +704,7 @@ def generate_chat_response_sync(
         messages.append({"role": msg["role"], "content": msg["content"]})
     messages.append({"role": "user", "content": new_message})
     
-    return call_chat_completion(config, messages, response_format_json=False)
+    return call_chat_completion(config, messages, response_format_json=False, disable_reasoning=False)
 
 def detect_language(text: str) -> str:
     """
@@ -723,8 +811,10 @@ def generate_translation(title: str, text: str, target_lang: str) -> str:
         "- Keep the paragraph structure and line breaks EXACTLY identical to the source text.\n"
         "- Do NOT add any notes, explanations, introduction, or prefix. Output ONLY the translated paragraphs.\n"
         f"- Translate to {eng_name} ({local_name}) faithfully, maintaining the original tone and style.\n"
+        "- Do NOT output any thinking process, reasoning, or <think> tags. Output ONLY the final translation.\n"
         f"- CRITICAL: Regardless of the source language, you must translate it into {eng_name} ({local_name}). "
-        f"Do NOT copy or output the original text if it is in a different language. You MUST output the translation in {local_name}.\n"
+        "Do NOT copy or output the original text if it is in a different language. You MUST output the translation in {local_name}.\n"
+        "- 绝对不要输出任何思考过程、推理内容或 <think> 标签！只能输出最终的翻译文本。\n"
         f"- 必须且只能将文本翻译为 {chn_name} ({local_name})，绝对不要直接输出原文！请输出完整的翻译后文本。"
     )
     
@@ -844,3 +934,155 @@ def identify_duplicate_categories(category_names: List[str]) -> List[Dict[str, s
     except Exception as e:
         logger.error(f"Error identifying duplicate categories: {e}", exc_info=True)
         return []
+
+def clean_think_block(text: str) -> str:
+    text = re.sub(r'(?s)<think>.*?</think>', '', text)
+    return re.sub(r'(?s)<think>.*$', '', text)
+
+class ThinkFilter:
+    def __init__(self):
+        self.in_think = False
+        self.buf = ""
+
+    def filter(self, chunk: str) -> str:
+        clean, _ = self.filter_ex(chunk)
+        return clean
+
+    def filter_ex(self, chunk: str) -> tuple[str, str]:
+        self.buf += chunk
+        output = ""
+        reasoning = ""
+        while True:
+            if self.in_think:
+                idx = self.buf.find("</think>")
+                if idx != -1:
+                    reasoning += self.buf[:idx]
+                    self.buf = self.buf[idx + len("</think>"):]
+                    self.in_think = False
+                    continue
+                has_partial = False
+                end_tag = "</think>"
+                for i in range(1, len(end_tag)):
+                    if self.buf.endswith(end_tag[:i]):
+                        has_partial = True
+                        break
+                if has_partial:
+                    for i in range(len(end_tag) - 1, 0, -1):
+                        if self.buf.endswith(end_tag[:i]):
+                            reasoning += self.buf[:len(self.buf) - i]
+                            self.buf = end_tag[:i]
+                            break
+                else:
+                    reasoning += self.buf
+                    self.buf = ""
+                break
+            else:
+                idx = self.buf.find("<think>")
+                if idx != -1:
+                    output += self.buf[:idx]
+                    self.buf = self.buf[idx + len("<think>"):]
+                    self.in_think = True
+                    continue
+                start_tag = "<think>"
+                partial_idx = -1
+                for i in range(1, len(start_tag)):
+                    if self.buf.endswith(start_tag[:i]):
+                        partial_idx = len(self.buf) - i
+                        break
+                if partial_idx != -1:
+                    output += self.buf[:partial_idx]
+                    self.buf = self.buf[partial_idx:]
+                else:
+                    output += self.buf
+                    self.buf = ""
+                break
+        return output, reasoning
+
+    def flush(self) -> str:
+        if not self.in_think:
+            res = self.buf
+            self.buf = ""
+            return res
+        return ""
+
+def is_reasoning_model(model: str) -> bool:
+    m = model.lower()
+    return "r1" in m or "qwq" in m or "reasoner" in m or "thinking" in m or "reasoning" in m or "qwen" in m or "3.6" in m or "3.5" in m or "a3b" in m
+
+def append_reasoning_disabler(req_payload: Dict[str, Any], model: str, base_url: str):
+    m = model.lower()
+    url = base_url.lower()
+    
+    # Gemini
+    if "gemini" in m or "googleapis.com" in url:
+        req_payload["thinking_config"] = {"thinking_budget": 0}
+        return
+        
+    # DeepSeek, Kimi, GLM, MiniMax
+    if any(x in m for x in ["deepseek", "kimi", "glm", "minimax"]) or any(x in url for x in ["deepseek", "moonshot", "zhipu"]):
+        req_payload["thinking"] = {"type": "disabled"}
+        return
+        
+    # Ollama
+    if "localhost:11434" in url or "127.0.0.1:11434" in url or "ollama" in m:
+        req_payload["think"] = False
+        return
+        
+    # vLLM / Llama.cpp / Qwen / Others
+    if is_reasoning_model(model):
+        req_payload["chat_template_kwargs"] = {"enable_thinking": False}
+        req_payload["enable_thinking"] = False
+
+def test_llm_reasoning(api_base_url: str, api_key: str, model: str):
+    import httpx
+    url = f"{api_base_url.rstrip('/')}/chat/completions"
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+        
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "user", "content": "Please respond with exactly one word 'hello' and absolutely nothing else."}
+        ]
+    }
+    
+    append_reasoning_disabler(payload, model, api_base_url)
+    
+    is_retry = False
+    try:
+        with httpx.Client(timeout=15.0) as client:
+            response = client.post(url, headers=headers, json=payload)
+            
+        if response.status_code == 400:
+            # Retry without disablers
+            for field in ["chat_template_kwargs", "thinking", "thinking_config", "think", "enable_thinking"]:
+                payload.pop(field, None)
+            is_retry = True
+            with httpx.Client(timeout=15.0) as client:
+                response = client.post(url, headers=headers, json=payload)
+                
+        if response.status_code != 200:
+            raise Exception(f"API returned status {response.status_code}: {response.text}")
+            
+        result = response.json()
+        if "choices" not in result or len(result["choices"]) == 0:
+            raise Exception("API returned empty choices")
+            
+        choice = result["choices"][0]
+        content = choice["message"].get("content") or ""
+        reasoning_content = choice["message"].get("reasoning_content") or ""
+        
+        reasoning_status = "not_reasoning"
+        has_reasoning = bool(reasoning_content) or "<think>" in content or "</think>" in content
+        is_reasoning_model_name = is_reasoning_model(model)
+        
+        if is_reasoning_model_name or has_reasoning:
+            if is_retry or has_reasoning:
+                reasoning_status = "unable_to_disable"
+            else:
+                reasoning_status = "disabled_successfully"
+                
+        return content, reasoning_status
+    except Exception as e:
+        raise Exception(f"Reasoning test failed: {str(e)}")
