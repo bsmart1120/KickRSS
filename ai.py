@@ -608,6 +608,8 @@ def generate_chat_response_stream(
     config = settings.get_ai_config("chat")
     lang_rule = get_chat_language_rule()
     
+    use_reasoning = config.get("use_reasoning", True)
+    
     system_prompt = (
         "You are a helpful assistant integrated into an RSS reader.\n"
         "You are helping the user discuss a specific article.\n"
@@ -636,7 +638,6 @@ def generate_chat_response_stream(
         "messages": messages,
         "stream": True
     }
-    use_reasoning = config.get("use_reasoning", True)
     if is_reasoning_model(config["model"]) and use_reasoning:
         payload["max_tokens"] = 8192
     elif config.get("max_tokens"):
@@ -706,6 +707,8 @@ def generate_chat_response_sync(
     config = settings.get_ai_config("chat")
     lang_rule = get_chat_language_rule()
     
+    use_reasoning = config.get("use_reasoning", True)
+    
     system_prompt = (
         "You are a helpful assistant integrated into an RSS reader.\n"
         "You are helping the user discuss a specific article.\n"
@@ -722,7 +725,6 @@ def generate_chat_response_sync(
         messages.append({"role": msg["role"], "content": msg["content"]})
     messages.append({"role": "user", "content": new_message})
     
-    use_reasoning = config.get("use_reasoning", True)
     return call_chat_completion(config, messages, response_format_json=False, disable_reasoning=not use_reasoning)
 
 def detect_language(text: str) -> str:
