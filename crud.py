@@ -233,20 +233,58 @@ def save_entries(
 
     for entry in raw_entries:
         # Check if guid already exists for this feed
-        cursor.execute("SELECT id FROM entries WHERE feed_id = ? AND guid = ?", (feed_id, entry.guid))
-        if cursor.fetchone():
+        cursor.execute("SELECT id, raw_content, fulltext_ready FROM entries WHERE feed_id = ? AND guid = ?", (feed_id, entry.guid))
+        existing = cursor.fetchone()
+        if existing:
+            existing_id, existing_content, existing_fulltext_ready = existing
+            new_content = entry.raw_content or ""
+            # Self-healing: If existing content lacks fulltext and feed has updated with longer text, update it
+            if not existing_fulltext_ready and len(new_content) > len(existing_content or ""):
+                fulltext_ready = 1 if len(new_content) >= min_chars else 0
+                if fulltext_ready == 1:
+                    cursor.execute("""
+                        UPDATE entries 
+                        SET raw_content = ?, fulltext_ready = ?, likely_no_text = 0
+                        WHERE id = ?
+                    """, (new_content, fulltext_ready, existing_id))
+                else:
+                    cursor.execute("""
+                        UPDATE entries 
+                        SET raw_content = ?, fulltext_ready = ?
+                        WHERE id = ?
+                    """, (new_content, fulltext_ready, existing_id))
+                
+                # If fulltext is now ready, clean and cache it
+                if fulltext_ready == 1:
+                    clean_content = clean_html(new_content)
+                    status = "ok" if len(clean_content) >= min_chars else "no_text"
+                    cursor.execute("SELECT entry_id FROM fulltext WHERE entry_id = ?", (existing_id,))
+                    if cursor.fetchone():
+                        cursor.execute("""
+                            UPDATE fulltext 
+                            SET content = ?, status = ?, fetched_at = ?, fetcher = 'feed'
+                            WHERE entry_id = ?
+                        """, (clean_content, status, now_str, existing_id))
+                    else:
+                        cursor.execute("""
+                            INSERT INTO fulltext (entry_id, content, status, fetched_at, fetcher)
+                            VALUES (?, ?, ?, ?, 'feed')
+                        """, (existing_id, clean_content, status, now_str))
             continue
 
         raw_content = entry.raw_content or ""
         raw_content_len = len(raw_content)
         
         # Decide fulltext_ready and likely_no_text
-        fulltext_ready = 1 if raw_content_len >= min_chars else 0
-        
-        content_lower = raw_content.lower()
-        likely_no_text = 0
-        if raw_content_len < min_chars and ("<video" in content_lower or "<iframe" in content_lower):
-            likely_no_text = 1
+        if getattr(entry, "likely_no_text", 0) or getattr(entry, "fulltext_ready", 0):
+            likely_no_text = entry.likely_no_text
+            fulltext_ready = entry.fulltext_ready
+        else:
+            fulltext_ready = 1 if raw_content_len >= min_chars else 0
+            content_lower = raw_content.lower()
+            likely_no_text = 0
+            if raw_content_len < min_chars and ("<video" in content_lower or "<iframe" in content_lower):
+                likely_no_text = 1
 
         # Insert entry
         cursor.execute("""
@@ -264,12 +302,18 @@ def save_entries(
 
         # If fulltext is ready (feed has full text), clean and cache it
         if fulltext_ready == 1:
-            clean_content = clean_html(raw_content)
-            status = "ok" if len(clean_content) >= min_chars else "no_text"
-            cursor.execute("""
-                INSERT INTO fulltext (entry_id, content, status, fetched_at, fetcher)
-                VALUES (?, ?, ?, ?, 'feed')
-            """, (entry_id, clean_content, status, now_str))
+            if likely_no_text == 1:
+                cursor.execute("""
+                    INSERT INTO fulltext (entry_id, content, status, fetched_at, fetcher)
+                    VALUES (?, '此文章主要包含视频/多媒体内容，无正文可提取。请点击标题或右上角链接查看原始视频。', 'video', ?, 'feed')
+                """, (entry_id, now_str))
+            else:
+                clean_content = clean_html(raw_content)
+                status = "ok" if len(clean_content) >= min_chars else "no_text"
+                cursor.execute("""
+                    INSERT INTO fulltext (entry_id, content, status, fetched_at, fetcher)
+                    VALUES (?, ?, ?, ?, 'feed')
+                """, (entry_id, clean_content, status, now_str))
 
     return new_count
 
@@ -421,6 +465,8 @@ def get_unclassified_entries(conn: sqlite3.Connection, feed_id: int) -> List[sql
         SELECT id, title, raw_content 
         FROM entries 
         WHERE feed_id = ? AND classified_at IS NULL
+        ORDER BY published_at DESC
+        LIMIT 100
     """, (feed_id,))
     return cursor.fetchall()
 
@@ -518,12 +564,25 @@ def save_fulltext(
         VALUES (?, ?, ?, ?, ?)
     """, (entry_id, content, status, now_str, fetcher))
     
-    # 2. Update entries table setting fulltext_ready = 1
-    cursor.execute("""
-        UPDATE entries 
-        SET fulltext_ready = 1 
-        WHERE id = ?
-    """, (entry_id,))
+    # 2. Update entries table setting fulltext_ready = 1 (and likely_no_text = 0 if status is ok)
+    if status == "ok":
+        cursor.execute("""
+            UPDATE entries 
+            SET fulltext_ready = 1, likely_no_text = 0 
+            WHERE id = ?
+        """, (entry_id,))
+    elif status == "video":
+        cursor.execute("""
+            UPDATE entries 
+            SET fulltext_ready = 1, likely_no_text = 1 
+            WHERE id = ?
+        """, (entry_id,))
+    else:
+        cursor.execute("""
+            UPDATE entries 
+            SET fulltext_ready = 1 
+            WHERE id = ?
+        """, (entry_id,))
 
 def save_chat_message(conn: sqlite3.Connection, entry_id: int, role: str, content: str):
     cursor = conn.cursor()
