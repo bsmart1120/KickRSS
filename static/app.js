@@ -203,6 +203,11 @@ const elements = {
     submitOpmlBtn: document.getElementById('submit-opml-btn'),
     fileUploadLabel: document.getElementById('file-upload-label'),
     
+    feedInfoBar: document.getElementById('feed-info-bar'),
+    feedUrlLink: document.getElementById('feed-url-link'),
+    feedUrlText: document.getElementById('feed-url-text'),
+    copyFeedUrlBtn: document.getElementById('copy-feed-url-btn'),
+    
     // Mobile Back Buttons
     mobileBackToFeeds: document.getElementById('mobile-back-to-feeds'),
     mobileBackToEntries: document.getElementById('mobile-back-to-entries'),
@@ -249,8 +254,91 @@ const elements = {
 document.addEventListener('DOMContentLoaded', () => {
     initTheme();
     initEventListeners();
-    loadSettingsOnStartup().then(() => {
-        loadFeeds();
+    loadSettingsOnStartup().then(async () => {
+        // Check if there is a saved navigation state
+        const savedStateStr = window.sessionStorage.getItem('KICKRSS_NAV_STATE');
+        window.sessionStorage.removeItem('KICKRSS_NAV_STATE'); // Clear it immediately
+        
+        let hasRestored = false;
+        if (savedStateStr) {
+            try {
+                const navState = JSON.parse(savedStateStr);
+                state.activeView = navState.activeView || 'unread';
+                state.selectedFeedId = navState.selectedFeedId;
+                state.selectedCategoryId = navState.selectedCategoryId;
+                state.filterUnreadOnly = navState.filterUnreadOnly !== false;
+                hasRestored = true;
+            } catch (e) {
+                console.error("Error parsing navigation state:", e);
+            }
+        }
+        
+        await loadFeeds();
+        
+        if (hasRestored) {
+            try {
+                const navState = JSON.parse(savedStateStr);
+                
+                // Restore filter checkbox UI state
+                if (elements.filterUnreadToggle) {
+                    elements.filterUnreadToggle.checked = state.filterUnreadOnly;
+                }
+                
+                // Clear active navigation buttons
+                if (elements.btnAllUnread) elements.btnAllUnread.classList.remove('active');
+                if (elements.btnStarred) elements.btnStarred.classList.remove('active');
+                if (elements.btnNotes) elements.btnNotes.classList.remove('active');
+                
+                // Reload correct entry list
+                if (state.activeView === 'feed' && state.selectedFeedId) {
+                    const feed = state.feeds.find(f => f.id === state.selectedFeedId);
+                    elements.currentCategoryName.textContent = feed ? feed.title : "订阅源";
+                    await loadFeedEntries(state.selectedFeedId);
+                } else if (state.activeView === 'category' && state.selectedCategoryId) {
+                    elements.currentCategoryName.textContent = navState.categoryName || "分类";
+                    document.querySelectorAll('.feed-row').forEach(node => node.classList.remove('active'));
+                    const parentFeedRow = document.querySelector(`.feed-item[data-id="${state.selectedFeedId}"] .feed-row`);
+                    if (parentFeedRow) parentFeedRow.classList.add('active');
+                    
+                    const feedItem = document.querySelector(`.feed-item[data-id="${state.selectedFeedId}"]`);
+                    if (feedItem) {
+                        feedItem.classList.add('expanded');
+                        await loadCategoriesForFeed(state.selectedFeedId, feedItem);
+                    }
+                    await loadCategoryEntries(state.selectedCategoryId);
+                } else if (state.activeView === 'starred') {
+                    if (elements.btnStarred) elements.btnStarred.classList.add('active');
+                    elements.currentCategoryName.textContent = "我的收藏";
+                    await loadStarredEntries();
+                } else if (state.activeView === 'notes') {
+                    if (elements.btnNotes) elements.btnNotes.classList.add('active');
+                    elements.currentCategoryName.textContent = "我的笔记";
+                    await loadNotesEntries();
+                } else {
+                    state.activeView = 'unread';
+                    if (elements.btnAllUnread) elements.btnAllUnread.classList.add('active');
+                    elements.currentCategoryName.textContent = "所有未读";
+                    await loadUnreadEntries();
+                }
+                
+                // Restore savedState's selected entry
+                if (navState.selectedEntryId) {
+                    await selectEntry(navState.selectedEntryId);
+                }
+                
+                // Restore mobile UI classes on body
+                if (navState.showEntries) {
+                    document.body.classList.add('show-entries');
+                }
+                if (navState.showDetail) {
+                    document.body.classList.add('show-detail');
+                }
+                return;
+            } catch (e) {
+                console.error("Error applying restored navigation state:", e);
+            }
+        }
+        
         selectGlobalUnread(true);
     });
     initResizers();
@@ -419,6 +507,23 @@ function initEventListeners() {
     }
     if (elements.btnBatchExportNotes) {
         elements.btnBatchExportNotes.addEventListener('click', () => exportSelectedNotes());
+    }
+    
+    if (elements.copyFeedUrlBtn) {
+        elements.copyFeedUrlBtn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            const url = elements.copyFeedUrlBtn.dataset.url || elements.feedUrlLink.href;
+            if (url && url !== '#') {
+                navigator.clipboard.writeText(url).then(() => {
+                    const labelSpan = elements.copyFeedUrlBtn.querySelector('span');
+                    const originalText = labelSpan ? labelSpan.textContent : '复制';
+                    if (labelSpan) labelSpan.textContent = '已复制!';
+                    setTimeout(() => {
+                        if (labelSpan) labelSpan.textContent = originalText;
+                    }, 1500);
+                });
+            }
+        });
     }
     
     if (elements.clearChatBtn) {
@@ -1160,7 +1265,7 @@ function renderFeedsTree() {
             <span class="drag-handle" title="按住拖动排序">⋮⋮</span>
             <span class="toggle-icon">▶</span>
             <span class="feed-icon">📰</span>
-            <span class="feed-title-text" title="${feed.title}">${feed.title}</span>
+            <span class="feed-title-text" title="${escapeHTML(feed.title)}\nRSS: ${escapeHTML(feed.url)}">${escapeHTML(feed.title)}</span>
             ${feed.unread_count > 0 ? `<span class="unread-badge">${feed.unread_count}</span>` : ''}
         `;
         
@@ -1337,6 +1442,7 @@ function selectGlobalUnread(isStartup = false) {
     if (elements.btnNotes) elements.btnNotes.classList.remove('active');
     
     elements.currentCategoryName.textContent = "所有未读";
+    if (elements.feedInfoBar) elements.feedInfoBar.style.display = 'none';
     loadUnreadEntries();
     
     // Mobile panel transition: only navigate to entries list if not starting up
@@ -1357,6 +1463,7 @@ function selectStarredView(isStartup = false) {
     if (elements.btnNotes) elements.btnNotes.classList.remove('active');
     
     elements.currentCategoryName.textContent = "我的收藏";
+    if (elements.feedInfoBar) elements.feedInfoBar.style.display = 'none';
     loadStarredEntries();
     
     if (isStartup !== true) {
@@ -1414,6 +1521,15 @@ async function selectFeed(feedId) {
     
     const feed = state.feeds.find(f => f.id === feedId);
     elements.currentCategoryName.textContent = feed ? feed.title : "订阅源";
+    
+    if (feed && feed.url && elements.feedInfoBar) {
+        elements.feedInfoBar.style.display = 'inline-flex';
+        elements.feedUrlLink.href = feed.url;
+        elements.feedUrlText.textContent = feed.url;
+        elements.copyFeedUrlBtn.dataset.url = feed.url;
+    } else if (elements.feedInfoBar) {
+        elements.feedInfoBar.style.display = 'none';
+    }
     
     loadFeedEntries(feedId);
     
@@ -1518,6 +1634,15 @@ function selectCategory(feedId, catId, catName) {
     
     const feed = state.feeds.find(f => f.id === feedId);
     elements.currentCategoryName.textContent = feed ? `${feed.title} › ${catName}` : catName;
+    
+    if (feed && feed.url && elements.feedInfoBar) {
+        elements.feedInfoBar.style.display = 'inline-flex';
+        elements.feedUrlLink.href = feed.url;
+        elements.feedUrlText.textContent = feed.url;
+        elements.copyFeedUrlBtn.dataset.url = feed.url;
+    } else if (elements.feedInfoBar) {
+        elements.feedInfoBar.style.display = 'none';
+    }
     
     loadCategoryEntries(catId);
     
@@ -3452,7 +3577,14 @@ async function loadAndRenderManageFeeds() {
             item.dataset.id = feed.id;
             
             item.innerHTML = `
-                <input type="text" class="manage-item-title-input" value="${escapeHTML(feed.title)}" title="${escapeHTML(feed.url)}" placeholder="订阅源名称">
+                <div class="manage-item-info" style="flex: 1; min-width: 0;">
+                    <input type="text" class="manage-item-title-input" value="${escapeHTML(feed.title)}" title="${escapeHTML(feed.url)}" placeholder="订阅源名称">
+                    <div class="manage-feed-url-row">
+                        <span class="manage-feed-url" title="${escapeHTML(feed.url)}">${escapeHTML(feed.url)}</span>
+                        <a href="${escapeHTML(feed.url)}" target="_blank" class="manage-url-action-btn" title="在新标签页中访问该 RSS 链接">🔗 访问</a>
+                        <button class="manage-url-action-btn copy-feed-item-url-btn" data-url="${escapeHTML(feed.url)}" title="复制 RSS 链接">📋 复制</button>
+                    </div>
+                </div>
                 <div class="manage-item-actions">
                     <label class="feed-switch" title="${feed.enabled ? '已启用抓取' : '已禁用抓取'}">
                         <input type="checkbox" class="feed-enabled-toggle" ${feed.enabled ? 'checked' : ''}>
@@ -3472,6 +3604,20 @@ async function loadAndRenderManageFeeds() {
                     </button>
                 </div>
             `;
+            
+            const copyUrlBtn = item.querySelector('.copy-feed-item-url-btn');
+            if (copyUrlBtn) {
+                copyUrlBtn.addEventListener('click', (e) => {
+                    e.stopPropagation();
+                    const url = copyUrlBtn.dataset.url;
+                    if (url) {
+                        navigator.clipboard.writeText(url).then(() => {
+                            copyUrlBtn.textContent = '✅ 已复制';
+                            setTimeout(() => { copyUrlBtn.textContent = '📋 复制'; }, 1500);
+                        });
+                    }
+                });
+            }
             
             const titleInput = item.querySelector('.manage-item-title-input');
             const enabledToggle = item.querySelector('.feed-enabled-toggle');
@@ -6705,11 +6851,32 @@ function initEngagementTracking() {
         });
     }
 
+    function saveNavigationState() {
+        const navState = {
+            activeView: state.activeView,
+            selectedFeedId: state.selectedFeedId,
+            selectedCategoryId: state.selectedCategoryId,
+            selectedEntryId: state.selectedEntryId,
+            filterUnreadOnly: state.filterUnreadOnly,
+            categoryName: elements.currentCategoryName.textContent,
+            showEntries: document.body.classList.contains('show-entries'),
+            showDetail: document.body.classList.contains('show-detail')
+        };
+        window.sessionStorage.setItem('KICKRSS_NAV_STATE', JSON.stringify(navState));
+    }
+
     if (elements.artOriginalLink) {
         elements.artOriginalLink.addEventListener('click', () => {
             if (currentEngagement) {
                 currentEngagement.openedOriginal = true;
             }
+            saveNavigationState();
+        });
+    }
+
+    if (elements.artTitleLink) {
+        elements.artTitleLink.addEventListener('click', () => {
+            saveNavigationState();
         });
     }
 
